@@ -12,6 +12,8 @@ a001,R6G,-14,1,8,8.txt
 '8,8': Steps for x and y.For example, a 60 * 60 rectangular array is named '60,60'
 The laser power, single step length of x and y, can be included at the position of 'A001'. The program will not process this information separately.
 
+
+In the data folder, there is a txt file named 'a001, R6G, -10,1,8,8'. Please refer to this file for the mapping file format. This format can be directly exported through the official program of Witec.
 # Function
 ## Rebaseline
 The baseline removal tool is based on asymmetric least squares method.
