@@ -1,0 +1,8 @@
+#shining_header
+#data type:raman_database
+#CAS:989-38-8
+#Material scientific name:rhodamine 6g
+#Other experimental details:{Integral time:100 ms}{Average number of times:5}{Concentration:1e-4 M}
+#Lable:1
+#shining_data	
+#shining_end
