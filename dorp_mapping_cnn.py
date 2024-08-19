@@ -108,10 +108,14 @@ class SpectrumAnalyzer:
         m_name = [f'raw_{self.target_wavelength}','p','1','0']
         #hotmaps_raw, hotmaps_p, hotmaps_0, hotmaps_1 = [],[],[],[]
         file_names = []
-        for file_name in tqdm(files, desc="Processing directory", position=0):
+        for file_name in tqdm(files, desc="Processing directory main", position=0):
             file_path = os.path.join(self.file_path, file_name)
             file_names.append(file_name)
-            hotmap = self.plot_spectrum_and_heatmap(file_path)
+            try:
+                hotmap = self.plot_spectrum_and_heatmap(file_path)
+            except:
+                print(file_name)
+                break
             for i in range(4):
                 hotmaps[i].append(hotmap[i])
 
