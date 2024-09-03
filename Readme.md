@@ -61,4 +61,9 @@ Train a CNN model for Raman spectroscopy classification and recognition, binary 
 ### smart2witec_windows.py
 Convert smart format to witec format.
 
+# Acknowledgements
+Thank you for the support provided by the following course institutions:
+- Xinping Zhang's research group, Beijing University of Technology, China.
+- Qiaoqiang Gan's research group, King Abdullah University of Science and Technology, Saudi Arabia.
+- Feifei Liu's research group, Tianjin Normal University, China.
 
