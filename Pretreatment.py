@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# Pretreatment.py
 """
 Created on Sun Oct 15 22:32:53 2023
 
@@ -20,6 +21,8 @@ from scipy.signal import stft
 import matplotlib.pyplot as plt
 from scipy import interpolate
 import re
+import csv
+from datetime import datetime
 from tqdm import tqdm
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
@@ -271,7 +274,8 @@ def baseline_als(y, lam=10**4,p=0.001, niter=3):
 import math
 
 class WitecRamanProcessor:
-    def __init__(self, input_dir, output_dir, target_wavelength=1339.6, lam=1e5, p=0.01, niter=3,start_wavelength=500,end_wavelength=2500,sigma=3):
+    def __init__(self, input_dir, output_dir, target_wavelength=1339.6, lam=1e5, p=0.01, niter=3,start_wavelength=500,end_wavelength=2500,sigma=3,
+                 compat_mode=False, log_path=None, header_mode='legacy', sniff_delimiters=None):
         """
         本类用于处理Witec的共聚焦拉曼显微镜所采集的拉曼mapping数据
         """
@@ -286,6 +290,15 @@ class WitecRamanProcessor:
         self.sigma = sigma  #去噪窗口宽度
         self.reback = True
         self.Denoise = True
+
+        # --- Compatibility / logging controls (optional; default keeps legacy behavior) ---
+        self.compat_mode = compat_mode
+        self.log_path = log_path
+        self.header_mode = header_mode
+        # sniff_delimiters: tuple of delimiters to try when compat_mode=True and delimiter is None
+        self.sniff_delimiters = tuple(sniff_delimiters) if sniff_delimiters is not None else ('\t', ',', ';', 'whitespace')
+        # Last read diagnostics (set by read_data in compat_mode)
+        self._last_read_info = {}
 
     def find_closest_point_index(self, spectral_data, x1, y1):
         """
@@ -321,11 +334,209 @@ class WitecRamanProcessor:
             return process, analyte, concentration, integration_time, x_points, y_points
         return None
 
-    def read_data(self, file_path,delimiter='\t'):
+    def _read_first_nonempty_line(self, file_path, max_lines=30):
+        """Read the first non-empty, non-null line from a text file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for _ in range(max_lines):
+                    line = f.readline()
+                    if not line:
+                        break
+                    s = line.strip()
+                    if s != '':
+                        return s
+        except Exception:
+            return None
+        return None
+
+    def _sniff_delimiter(self, first_line):
+        """Heuristically choose a delimiter from self.sniff_delimiters based on the first line."""
+        if not first_line:
+            return None
+        best = None
+        best_cols = 0
+        for d in self.sniff_delimiters:
+            if d == 'whitespace':
+                cols = len(re.split(r'\s+', first_line.strip()))
+            else:
+                cols = len(first_line.split(d))
+            if cols > best_cols:
+                best_cols = cols
+                best = d
+        # Need at least 2 columns (x + at least one spectrum)
+        if best_cols < 2:
+            return None
+        return best
+
+    def _detect_header(self, first_line, delimiter_token):
+        """Return True if the first line looks like a header row, False if it looks like numeric data."""
+        if not first_line:
+            return True
+        if delimiter_token == 'whitespace':
+            tokens = re.split(r'\s+', first_line.strip())
+        else:
+            tokens = first_line.split(delimiter_token)
+        tokens = [t.strip() for t in tokens if t.strip() != '']
+        if len(tokens) < 2:
+            return True
+
+        def is_float(x):
+            try:
+                float(x)
+                return True
+            except Exception:
+                return False
+
+        floatable = sum(1 for t in tokens if is_float(t))
+        ratio = floatable / max(1, len(tokens))
+        # If most tokens are numeric, treat as *no header*
+        return ratio < 0.8
+
+    def _ensure_log_header(self):
+        """Create log file with header if needed."""
+        if not self.log_path:
+            return
+        try:
+            if not os.path.exists(self.log_path):
+                os.makedirs(os.path.dirname(self.log_path), exist_ok=True) if os.path.dirname(self.log_path) else None
+                with open(self.log_path, 'w', newline='', encoding='utf-8') as f:
+                    w = csv.writer(f)
+                    w.writerow(['src_filename', 'dst_filename', 'issues', 'timestamp'])
+        except Exception:
+            # Logging must never break processing
+            pass
+
+    def _append_log(self, src_filename, dst_filename, issues):
+        """Append one row to the log. issues can be list[str] or str."""
+        if not self.log_path:
+            return
+        try:
+            self._ensure_log_header()
+            if isinstance(issues, (list, tuple)):
+                issues_str = ';'.join([str(x) for x in issues if x])
+            else:
+                issues_str = str(issues)
+            with open(self.log_path, 'a', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow([src_filename, dst_filename, issues_str, datetime.now().isoformat(timespec='seconds')])
+        except Exception:
+            pass
+
+    def read_data(self, file_path, delimiter='\t'):
         """
         读取高光谱数据。
+
+        Backward compatible behavior:
+        - compat_mode=False (default): uses pandas read_csv with the given delimiter (legacy behavior).
+        - compat_mode=True: if delimiter is None, auto-sniff delimiter and auto-detect header (when header_mode='auto').
         """
-        data = pd.read_csv(file_path, delimiter=delimiter)
+        # Legacy path: keep behavior unchanged
+        if not getattr(self, 'compat_mode', False):
+            data = pd.read_csv(file_path, delimiter=delimiter)
+            wavelengths = data.iloc[:, 0]
+            spectral_data = data.iloc[:, 1:]
+            return wavelengths, spectral_data
+
+        # Compat path
+        # 1) Read a few non-empty lines for robust delimiter sniffing (avoid header traps)
+        lines = []
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for _ in range(30):
+                    line = f.readline()
+                    if not line:
+                        break
+                    s = line.strip()
+                    if s:
+                        lines.append(s)
+        except Exception:
+            lines = []
+
+        if not lines:
+            raise ValueError('read_failed')
+
+        def _floatable_ratio(tokens):
+            ok = 0
+            for t in tokens:
+                try:
+                    float(t)
+                    ok += 1
+                except Exception:
+                    pass
+            return ok / max(1, len(tokens))
+
+        # choose a "data-like" line for delimiter sniffing:
+        # - skip the very first non-empty line (often header)
+        # - prefer lines where most tokens are numeric
+        candidate_lines = lines[1:] if len(lines) >= 2 else lines[:]
+        data_line = None
+        for s in candidate_lines:
+            # Try common splits for judging numeric-ness
+            for split_kind in ('\t', ',', ';', 'whitespace'):
+                toks = (re.split(r'\s+', s) if split_kind == 'whitespace' else s.split(split_kind))
+                toks = [x.strip() for x in toks if x.strip() != '']
+                if len(toks) >= 2 and _floatable_ratio(toks) >= 0.8:
+                    data_line = s
+                    break
+            if data_line is not None:
+                break
+
+        # fallback if we didn't find a numeric-like data line: use 2nd non-empty line if possible
+        if data_line is None:
+            data_line = candidate_lines[0] if candidate_lines else lines[0]
+
+        # 2) Decide delimiter:
+        # rule: prefer '\t' unless it obviously doesn't work; only then sniff others
+        used_delim = delimiter
+        if used_delim is None:
+            # Try tab first
+            tab_cols = len(data_line.split('\t'))
+            if tab_cols >= 2:
+                used_delim = '\t'
+            else:
+                used_delim = self._sniff_delimiter(data_line)
+
+        if used_delim is None:
+            raise ValueError('delimiter_unknown')
+
+        # 3) Decide header: use the *first* non-empty line as header candidate,
+        # but delimiter judgement comes from data_line.
+        first_line = lines[0]
+        has_header = True
+        if getattr(self, 'header_mode', 'legacy') == 'auto':
+            has_header = self._detect_header(first_line, used_delim)
+
+        # 4) Build pandas read_csv args
+        read_kwargs = {}
+        if used_delim == 'whitespace':
+            read_kwargs['sep'] = r'\s+'
+            read_kwargs['engine'] = 'python'
+        else:
+            read_kwargs['delimiter'] = used_delim
+
+        read_kwargs['header'] = 0 if has_header else None
+
+        data = pd.read_csv(file_path, **read_kwargs)
+
+        # If no header, assign default column names
+        if not has_header:
+            ncols = data.shape[1]
+            if ncols < 2:
+                raise ValueError('data_format_invalid')
+            cols = ['X-Axis'] + [f'Spec{i}' for i in range(1, ncols)]
+            data.columns = cols
+
+        # Basic validation
+        if data.shape[1] < 2:
+            raise ValueError('data_format_invalid')
+
+        # Record diagnostics for caller
+        self._last_read_info = {
+            'delimiter_used': used_delim,
+            'has_header': bool(has_header),
+            'ncols': int(data.shape[1]),
+        }
+
         wavelengths = data.iloc[:, 0]
         spectral_data = data.iloc[:, 1:]
         return wavelengths, spectral_data
@@ -552,78 +763,108 @@ class WitecRamanProcessor:
     def process_file_reBaseLine(self, file_path, delimiter='\t'):
         """
         处理单个文件，生成结果并保存。
+
+        Backward compatible behavior:
+        - compat_mode=False (default): legacy strict behavior (filename must match parse_filename, delimiter defaults to '\t').
+        - compat_mode=True: if filename does not match, still process with a fallback output name; auto header/delimiter when enabled;
+          record non-standard or failed files into log (when log_path is provided).
         """
-        # 从文件名中解析信息
+        issues = []
+
+        # From filename: legacy validation (keep parse logic unchanged)
         parsed_info = self.parse_filename(file_path)
-        #print(parsed_info)
         if parsed_info is None:
-            return
-        process, analyte, concentration, integration_time, x_points, y_points = parsed_info
+            issues.append('filename_not_standard')
+            if not getattr(self, 'compat_mode', False):
+                return  # legacy behavior
+        else:
+            process, analyte, concentration, integration_time, x_points, y_points = parsed_info
 
-        # 读取数据
-        wavelengths, spectral_data = self.read_data(file_path, delimiter)
+        # Determine output filename (fallback if parse failed)
+        base = os.path.splitext(os.path.basename(file_path))[0]
+        
+        out_name = f"{base}_reBaseLine.txt"
 
 
-        # 应用基线校正和去噪
+        output_path = os.path.join(self.output_dir, out_name)
+
+        # Read data
+        try:
+            if getattr(self, 'compat_mode', False):
+                # allow auto delimiter sniffing when caller didn't force delimiter
+                delim_to_use = delimiter
+                if delim_to_use == '\t' and getattr(self, 'header_mode', 'legacy') == 'auto':
+                    # In compat mode, user may still pass '\t' by default; we only auto-sniff when delimiter=None.
+                    # To enable sniffing from the GUI, pass delimiter=None.
+                    pass
+                wavelengths, spectral_data = self.read_data(file_path, delim_to_use)
+            else:
+                wavelengths, spectral_data = self.read_data(file_path, delimiter)
+        except Exception as e:
+            # In compat mode, log and skip; in legacy mode, re-raise to preserve behavior as much as possible
+            if getattr(self, 'compat_mode', False):
+                err = str(e)
+                if 'delimiter_unknown' in err:
+                    issues.append('delimiter_unknown')
+                elif 'data_format_invalid' in err:
+                    issues.append('data_format_invalid')
+                else:
+                    issues.append('read_failed')
+                self._append_log(os.path.basename(file_path), os.path.basename(output_path), issues)
+                return
+            raise
+
+        # Header / XY checks (compat diagnostics only)
+        if getattr(self, 'compat_mode', False):
+            info = getattr(self, '_last_read_info', {}) or {}
+            if info.get('has_header') is False:
+                issues.append('header_missing')
+
+            # If there is a header but no (x/y) pattern in any spectrum column name, record it.
+            # This is relevant for mapping workflows; multi-spectra may legitimately not have xy.
+            try:
+                cols = list(spectral_data.columns)
+                has_xy = any(re.search(r'\(\s*\d+\s*/\s*\d+\s*\)', str(c)) for c in cols)
+                if info.get('has_header') is True and not has_xy:
+                    issues.append('header_no_xy')
+            except Exception:
+                pass
+
+        # Baseline correction
         r_baselines = self.apply_baseline_correction(spectral_data)
-        # 将spectral_data和wavelengths_df按列合并
-        data_reBaseLine = pd.concat([wavelengths, r_baselines], axis=1)
 
+        # Save
+        try:
+            result = pd.concat([wavelengths, r_baselines], axis=1)
+            os.makedirs(self.output_dir, exist_ok=True)
+            result.to_csv(output_path, sep='\t', index=False)  # output_path ends with .txt, that's fine
+        except Exception:
+            if getattr(self, 'compat_mode', False):
+                issues.append('save_failed')
+                self._append_log(os.path.basename(file_path), os.path.basename(output_path), issues)
+                return
+            raise
 
-        # 创建输出目录
-        output_path = os.path.join(self.output_dir, os.path.splitext(os.path.basename(file_path))[0])
-        #os.makedirs(output_path, exist_ok=True)
-        data_reBaseLine.to_csv(output_path+'_reBaseLine.txt', sep='\t', index=False)
+        # Log non-standard but processed
+        if getattr(self, 'compat_mode', False) and issues:
+            self._append_log(os.path.basename(file_path), os.path.basename(output_path), issues)
 
     def process_directory_reBaseLine(self):
         """
         批量处理文件夹中的所有文件，目的是去基线并保存。
         """
+        if getattr(self, 'compat_mode', False) and self.log_path:
+            self._ensure_log_header()
+
         files = [file for file in os.listdir(self.input_dir) if file.endswith('.txt')]
-        for file_name in tqdm(files, desc="Processing directory", position=0):
+        for file_name in tqdm(files, desc="Processing directory", unit="file"):
             file_path = os.path.join(self.input_dir, file_name)
-            self.process_file_reBaseLine(file_path)
+            # In compat mode, pass delimiter=None to enable sniffing; otherwise keep legacy default '\t'
+            if getattr(self, 'compat_mode', False):
+                self.process_file_reBaseLine(file_path, delimiter=None)
+            else:
+                self.process_file_reBaseLine(file_path)
 
-
-class SpectralLabelingApp:
-    def __init__(self,master, spectral_data, template_file, output_dir, wavelengths, mark_list,file_name0, start_wavelength=500, end_wavelength=1800):
-        self.master = master
-
-        self.start_wavelength = start_wavelength
-        self.end_wavelength = end_wavelength
-        self.wavelengths = wavelengths
-        self.spectral_data = spectral_data
-        self.template_file = template_file
-        self.output_dir = output_dir
-        self.current_index = 0
-        self.labels = []
-        self.mark_list = mark_list
-        self.file_name0 = file_name0
-
-
-        self.fig, self.ax = plt.subplots()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.master)
-        self.canvas.get_tk_widget().pack()
-
-        self.label_frame = tk.Frame(master)
-        self.label_frame.pack()
-
-        self.button_yes = tk.Button(self.label_frame, text="   Yes   ", command=lambda: self.label_spectrum(1))
-        self.button_yes.pack(side=tk.LEFT)
-
-        self.button_no = tk.Button(self.label_frame, text="   No   ", command=lambda: self.label_spectrum(0))
-        self.button_no.pack(side=tk.LEFT)
-
-        self.button_uncertainty = tk.Button(self.label_frame, text="uncertainty", command=lambda: self.label_spectrum(2))
-        self.button_uncertainty.pack(side=tk.LEFT)
-
-
-        self.update_plot()
-
-
-
-
-        #self.update_plot()
     def read_template(self,template_file):
         with open(template_file, 'r') as file:
             lines = file.readlines()
